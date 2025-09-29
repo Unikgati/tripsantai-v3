@@ -72,6 +72,13 @@ export default async function handler(req, res) {
   const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown';
   if (!email || !password) return res.status(400).json({ error: 'Missing credentials' });
 
+  // non-production debug helper
+  if (process.env.NODE_ENV !== 'production') {
+    try {
+      console.debug('admin-login debug: incoming', { ip, headers: req.headers, body: req.body });
+    } catch (e) { /* ignore */ }
+  }
+
   try {
     const failed = await fetchFailedRow(email);
     if (failed && failed.locked_until && new Date(failed.locked_until) > new Date()) {
@@ -81,18 +88,26 @@ export default async function handler(req, res) {
     // TODO: verify recaptcha if supplied and attempts exceed CAPTCHA_THRESHOLD
 
     // Proxy sign-in to Supabase Auth via the token endpoint
-    const tokenUrl = `${SUPABASE_URL}/auth/v1/token?grant_type=password`;
+    // Call the token endpoint. Put grant_type in the request body for compatibility.
+    const tokenUrl = `${SUPABASE_URL}/auth/v1/token`;
     const form = new URLSearchParams();
+    form.append('grant_type', 'password');
     form.append('email', email);
     form.append('password', password);
 
+    // Use apikey header. Avoid sending Authorization: Bearer <service_key> here which
+    // may not be necessary and can be rejected by some Supabase deployments.
     const authResp = await fetch(tokenUrl, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded', apikey: SERVICE_ROLE_KEY, Authorization: `Bearer ${SERVICE_ROLE_KEY}` },
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', apikey: SERVICE_ROLE_KEY },
       body: form.toString()
     });
 
     if (!authResp.ok) {
+      // debug: try to read body to help diagnose 401s in deployed environment
+      let debugBody = null;
+      try { debugBody = await authResp.text(); } catch (e) { /* ignore */ }
+      console.warn('admin-login: token endpoint rejected credentials', authResp.status, debugBody);
       // increment failed attempts
       await upsertFailed(email);
       return res.status(401).json({ error: 'Invalid credentials' });
