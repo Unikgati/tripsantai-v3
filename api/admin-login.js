@@ -12,8 +12,9 @@
 
 const SUPABASE_URL = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL;
 const SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SERVICE_ROLE;
-const LOCK_THRESHOLD = Number(process.env.ADMIN_LOCK_THRESHOLD || 8);
-const CAPTCHA_THRESHOLD = Number(process.env.ADMIN_CAPTCHA_THRESHOLD || 5);
+// Set lower thresholds for faster lockout/testing (can override via env)
+const LOCK_THRESHOLD = Number(process.env.ADMIN_LOCK_THRESHOLD || 3);
+const CAPTCHA_THRESHOLD = Number(process.env.ADMIN_CAPTCHA_THRESHOLD || 2);
 const LOCK_MINUTES = Number(process.env.ADMIN_LOCK_MINUTES || 15);
 
 async function fetchFailedRow(email) {
