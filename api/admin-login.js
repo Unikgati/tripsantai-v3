@@ -1,126 +1,108 @@
-/*
-  Server-side admin login proxy with basic failed-attempt tracking.
-  - POST /api/admin-login with { email, password, recaptchaToken? }
-  - Server checks auth_failed_logins table via PostgREST (uses SERVICE_ROLE_KEY)
-  - If locked -> return 423
-  - Proxy sign-in to Supabase Auth (server-side) and on success reset attempts
-  - On failure increment attempts and possibly set locked_until
-
-  NOTE: This is a minimal implementation. For production use, add Redis rate-limits,
-  enforce recaptcha, set HttpOnly cookie for sessions, and add logging/alerts.
-*/
-
-const SUPABASE_URL = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL;
-const SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SERVICE_ROLE;
-// Set lower thresholds for faster lockout/testing (can override via env)
-const LOCK_THRESHOLD = Number(process.env.ADMIN_LOCK_THRESHOLD || 3);
-const CAPTCHA_THRESHOLD = Number(process.env.ADMIN_CAPTCHA_THRESHOLD || 2);
-const LOCK_MINUTES = Number(process.env.ADMIN_LOCK_MINUTES || 15);
-
-async function fetchFailedRow(email) {
-  const url = `${SUPABASE_URL}/rest/v1/auth_failed_logins?email=eq.${encodeURIComponent(email)}`;
-  const resp = await fetch(url, { headers: { apikey: SERVICE_ROLE_KEY, Authorization: `Bearer ${SERVICE_ROLE_KEY}` } });
-  if (!resp.ok) return null;
-  const data = await resp.json();
-  return Array.isArray(data) && data.length ? data[0] : null;
-}
-
-async function upsertFailed(email) {
-  const url = `${SUPABASE_URL}/rest/v1/auth_failed_logins`;
-  const body = { email, attempts: 1, last_attempt: new Date().toISOString() };
-  // Use upsert via PostgREST ON CONFLICT email => increment attempts
-  // PostgREST doesn't support increment in upsert; perform fetch-update loop (best-effort)
-  // Try to insert first
-  let inserted = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', apikey: SERVICE_ROLE_KEY, Authorization: `Bearer ${SERVICE_ROLE_KEY}` },
-    body: JSON.stringify(body)
-  }).then(r => r.ok ? r.json().catch(() => null) : null).catch(() => null);
-  if (inserted) return inserted;
-
-  // Fallback: patch existing row by incrementing attempts (read-modify-write)
-  const existing = await fetchFailedRow(email);
-  if (!existing) return null;
-  const newAttempts = (existing.attempts || 0) + 1;
-  const patch = { attempts: newAttempts, last_attempt: new Date().toISOString() };
-  if (newAttempts >= LOCK_THRESHOLD) {
-    const until = new Date(Date.now() + LOCK_MINUTES * 60 * 1000).toISOString();
-    patch.locked_until = until;
-  }
-  const patchUrl = `${SUPABASE_URL}/rest/v1/auth_failed_logins?email=eq.${encodeURIComponent(email)}`;
-  await fetch(patchUrl, { method: 'PATCH', headers: { 'Content-Type': 'application/json', apikey: SERVICE_ROLE_KEY, Authorization: `Bearer ${SERVICE_ROLE_KEY}` }, body: JSON.stringify(patch) });
-  return { ...existing, ...patch };
-}
-
-async function resetFailed(email) {
-  const url = `${SUPABASE_URL}/rest/v1/auth_failed_logins?email=eq.${encodeURIComponent(email)}`;
-  await fetch(url, { method: 'DELETE', headers: { apikey: SERVICE_ROLE_KEY, Authorization: `Bearer ${SERVICE_ROLE_KEY}` } }).catch(() => null);
-}
+// api/admin-login.js
+// Server-side admin login proxy with optional reCAPTCHA verification and simple IP rate limiting.
+// Env vars used: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, RECAPTCHA_SECRET (optional)
 
 export default async function handler(req, res) {
-  if (req.method === 'OPTIONS') {
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'POST,OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-    return res.status(204).end();
-  }
+	const setCors = () => {
+		// In production, replace '*' with your origin.
+		res.setHeader('Access-Control-Allow-Origin', '*');
+		res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+		res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+		res.setHeader('Access-Control-Max-Age', '3600');
+	};
+	setCors();
 
-  if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
-  if (!SUPABASE_URL || !SERVICE_ROLE_KEY) return res.status(500).json({ error: 'Server not configured' });
+	if (req.method === 'OPTIONS') {
+		res.status(204).end();
+		return;
+	}
 
-  const { email, password, recaptchaToken } = req.body || {};
-  const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown';
-  if (!email || !password) return res.status(400).json({ error: 'Missing credentials' });
+	if (req.method !== 'POST') {
+		res.setHeader('Allow', 'POST');
+		return res.status(405).json({ error: 'Method not allowed' });
+	}
 
-  // non-production debug helper
-  if (process.env.NODE_ENV !== 'production') {
-    try {
-      console.debug('admin-login debug: incoming', { ip, headers: req.headers, body: req.body });
-    } catch (e) { /* ignore */ }
-  }
+	const SUPABASE_URL = process.env.SUPABASE_URL;
+	const SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+	const RECAPTCHA_SECRET = process.env.RECAPTCHA_SECRET || process.env.RECAPTCHA_V3_SECRET;
 
-  try {
-    const failed = await fetchFailedRow(email);
-    if (failed && failed.locked_until && new Date(failed.locked_until) > new Date()) {
-      return res.status(423).json({ error: 'Account temporarily locked' });
-    }
+	if (!SUPABASE_URL || !SERVICE_ROLE_KEY) {
+		return res.status(500).json({ error: 'Server misconfiguration: missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY' });
+	}
 
-    // TODO: verify recaptcha if supplied and attempts exceed CAPTCHA_THRESHOLD
+	try {
+		const body = req.body || {};
+		const email = (body.email || '').toString();
+		const password = (body.password || '').toString();
+		const recaptchaToken = body.recaptchaToken || '';
 
-    // Proxy sign-in to Supabase Auth via the token endpoint
-    // Call the token endpoint. Put grant_type in the request body for compatibility.
-    const tokenUrl = `${SUPABASE_URL}/auth/v1/token`;
-    const form = new URLSearchParams();
-    form.append('grant_type', 'password');
-    form.append('email', email);
-    form.append('password', password);
+		if (!email || !password) return res.status(400).json({ error: 'Missing email or password' });
 
-    // Use apikey header. Avoid sending Authorization: Bearer <service_key> here which
-    // may not be necessary and can be rejected by some Supabase deployments.
-    const authResp = await fetch(tokenUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded', apikey: SERVICE_ROLE_KEY },
-      body: form.toString()
-    });
+		// Simple in-memory rate limiter keyed by IP
+		// NOTE: This is a best-effort mitigation for small deployments. For production use a shared store (redis) or platform rate limits.
+		const RATE_WINDOW_MS = 5 * 60 * 1000; // 5 minutes
+		const MAX_ATTEMPTS = 6;
+		const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown').toString();
+		if (!global._adminLoginAttempts) global._adminLoginAttempts = new Map();
+		const attempts = global._adminLoginAttempts;
+		const now = Date.now();
+		let entry = attempts.get(ip);
+		if (!entry || now - entry.first > RATE_WINDOW_MS) {
+			entry = { count: 0, first: now };
+		}
+		entry.count = (entry.count || 0) + 1;
+		attempts.set(ip, entry);
+		if (entry.count > MAX_ATTEMPTS) {
+			return res.status(429).json({ error: 'Too many login attempts. Try again later.' });
+		}
 
-    if (!authResp.ok) {
-      // debug: try to read body to help diagnose 401s in deployed environment
-      let debugBody = null;
-      try { debugBody = await authResp.text(); } catch (e) { /* ignore */ }
-      console.warn('admin-login: token endpoint rejected credentials', authResp.status, debugBody);
-      // increment failed attempts
-      await upsertFailed(email);
-      return res.status(401).json({ error: 'Invalid credentials' });
-    }
+		// Optional reCAPTCHA verification when secret configured
+		if (RECAPTCHA_SECRET) {
+			if (!recaptchaToken) return res.status(400).json({ error: 'Missing recaptcha token' });
+			try {
+				const rcResp = await fetch('https://www.google.com/recaptcha/api/siteverify', {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+					body: new URLSearchParams({ secret: RECAPTCHA_SECRET, response: recaptchaToken }),
+				});
+				const rcJson = await rcResp.json();
+				// For v3, you may want to check score as well (rcJson.score)
+				if (!rcJson || rcJson.success !== true) {
+					return res.status(401).json({ error: 'Failed recaptcha verification' });
+				}
+			} catch (e) {
+				console.warn('recaptcha verify failed', e && e.message ? e.message : e);
+				return res.status(500).json({ error: 'recaptcha verification error' });
+			}
+		}
 
-    const authJson = await authResp.json();
-    // On success: reset failed attempts
-    await resetFailed(email);
+		// Call Supabase auth REST to perform password grant
+		const authUrl = `${SUPABASE_URL.replace(/\/$/, '')}/auth/v1/token?grant_type=password`;
+		const authResp = await fetch(authUrl, {
+			method: 'POST',
+			headers: {
+				'Content-Type': 'application/json',
+				'apikey': SERVICE_ROLE_KEY,
+			},
+			body: JSON.stringify({ email, password }),
+		});
 
-    // For now return the auth JSON to client. In production prefer HttpOnly secure cookie.
-    return res.status(200).json({ data: authJson });
-  } catch (err) {
-    console.error('admin-login error', err);
-    return res.status(500).json({ error: 'Server error' });
-  }
+		const authJson = await authResp.json().catch(() => null);
+		if (!authResp.ok) {
+			// Increment entry count further on explicit bad credential response to make brute force harder
+			entry.count = (entry.count || 0) + 1;
+			attempts.set(ip, entry);
+			const msg = (authJson && (authJson.error_description || authJson.error || authJson.message)) || 'Invalid credentials';
+			return res.status(401).json({ error: msg });
+		}
+
+		// Successful sign-in: return the auth payload to client so client can set session locally.
+		// authJson typically contains: access_token, expires_in, refresh_token, user
+		return res.status(200).json(authJson || {});
+
+	} catch (err) {
+		console.error('admin-login error', err);
+		return res.status(500).json({ error: 'Internal server error' });
+	}
 }
+
