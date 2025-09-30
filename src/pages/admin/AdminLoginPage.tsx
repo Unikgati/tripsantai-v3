@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { SpinnerIcon } from '../../components/Icons';
 import { useToast } from '../../components/Toast';
 import getSupabaseClient from '../../lib/supabase';
@@ -12,17 +12,17 @@ export const AdminLoginPage: React.FC<AdminLoginPageProps> = ({ onLogin }) => {
     const [password, setPassword] = useState('');
     const { showToast } = useToast();
     const [isLoading, setIsLoading] = useState(false);
+    const [recaptchaReady, setRecaptchaReady] = useState(false);
+    const [recaptchaError, setRecaptchaError] = useState<string | null>(null);
 
-    const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-        setIsLoading(true);
-        // Try to fetch reCAPTCHA token if site key configured
+    // Preload grecaptcha on mount if site key available
+    useEffect(() => {
         const siteKey = (import.meta.env.VITE_RECAPTCHA_SITE_KEY || '').toString();
-        const getRecaptchaToken = async (): Promise<string | null> => {
-            if (!siteKey) return null;
+        if (!siteKey) return;
+        const win = window as any;
+        let mounted = true;
+        const load = async () => {
             try {
-                // If grecaptcha not loaded, inject script
-                const win = window as any;
                 if (!win.grecaptcha) {
                     await new Promise<void>((resolve, reject) => {
                         const s = document.createElement('script');
@@ -34,9 +34,46 @@ export const AdminLoginPage: React.FC<AdminLoginPageProps> = ({ onLogin }) => {
                         document.head.appendChild(s);
                     });
                 }
-                if (!win.grecaptcha || !win.grecaptcha.execute) return null;
-                const token: string = await win.grecaptcha.execute(siteKey, { action: 'admin_login' });
-                return token || null;
+                if (win.grecaptcha && typeof win.grecaptcha.ready === 'function') {
+                    win.grecaptcha.ready(() => { if (mounted) setRecaptchaReady(true); });
+                } else {
+                    if (mounted) setRecaptchaError('reCAPTCHA not available');
+                }
+            } catch (e) {
+                console.warn('recaptcha preload failed', e && (e as Error).message ? (e as Error).message : e);
+                if (mounted) setRecaptchaError('Failed to load reCAPTCHA');
+            }
+        };
+        load();
+        return () => { mounted = false; };
+    }, []);
+
+    const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+        setIsLoading(true);
+        // Try to fetch reCAPTCHA token if site key configured
+        const siteKey = (import.meta.env.VITE_RECAPTCHA_SITE_KEY || '').toString();
+        const getRecaptchaToken = async (): Promise<string | null> => {
+            if (!siteKey) return null;
+            const win = window as any;
+            if (!win.grecaptcha || typeof win.grecaptcha.execute !== 'function') return null;
+            try {
+                // ensure ready
+                await new Promise<void>((resolve) => {
+                    try {
+                        win.grecaptcha.ready(resolve);
+                    } catch (e) {
+                        resolve();
+                    }
+                });
+                // execute with timeout
+                const tokenPromise = win.grecaptcha.execute(siteKey, { action: 'admin_login' });
+                const token = await Promise.race([
+                    tokenPromise,
+                    new Promise<null>((res) => setTimeout(() => res(null), 5000))
+                ]);
+                if (!token) return null;
+                return token as string;
             } catch (e) {
                 console.warn('recaptcha exec failed', e && (e as Error).message ? (e as Error).message : e);
                 return null;
@@ -44,13 +81,25 @@ export const AdminLoginPage: React.FC<AdminLoginPageProps> = ({ onLogin }) => {
         };
     try {
             // Call server-side login proxy which can enforce recaptcha and rate-limits
+            setRecaptchaError(null);
+            // don't attempt if recaptcha isn't ready
+            if (!recaptchaReady && (import.meta.env.VITE_RECAPTCHA_SITE_KEY || '').toString()) {
+                setRecaptchaError('reCAPTCHA masih dimuat, coba lagi sebentar');
+                setIsLoading(false);
+                return;
+            }
             const recaptchaToken = await getRecaptchaToken();
+            if (!recaptchaToken && (import.meta.env.VITE_RECAPTCHA_SITE_KEY || '').toString()) {
+                setRecaptchaError('Gagal memverifikasi reCAPTCHA — refresh dan coba lagi');
+                setIsLoading(false);
+                return;
+            }
             const resp = await fetch('/api/admin-login', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ email: username, password, recaptchaToken })
             });
-            const json = await resp.json().catch(() => null);
+                const json = await resp.json().catch(() => null);
             if (!resp.ok) {
                 const msg = (json && (json.error || json.message)) || `Login failed (${resp.status})`;
                 try { showToast(msg, 'error'); } catch {}
@@ -110,6 +159,7 @@ export const AdminLoginPage: React.FC<AdminLoginPageProps> = ({ onLogin }) => {
                             disabled={isLoading}
                         />
                     </div>
+                    {recaptchaError && <div className="form-error" style={{ color: 'crimson', marginTop: 8 }}>{recaptchaError}</div>}
                     <button type="submit" className={`btn btn-primary btn-large ${isLoading ? 'loading' : ''}`} disabled={isLoading}>
                         {isLoading && <SpinnerIcon />}
                         <span>Login</span>
