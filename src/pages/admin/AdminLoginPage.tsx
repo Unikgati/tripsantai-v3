@@ -72,40 +72,6 @@ export const AdminLoginPage: React.FC<AdminLoginPageProps> = ({ onLogin }) => {
                 console.warn('Failed to set supabase session from server response', e);
             }
 
-            // If server asks for MFA, prompt for code and finalize
-            if (json && json.mfa_required && json.ticket) {
-                const code = window.prompt('Enter MFA code from your authenticator app');
-                if (!code) {
-                    try { showToast('MFA code required', 'error'); } catch {}
-                    setIsLoading(false);
-                    return;
-                }
-                // finalize MFA
-                const verifyResp = await fetch('/api/admin-login-mfa', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ ticket: json.ticket, code })
-                });
-                const verifyJson = await verifyResp.json().catch(() => null);
-                if (!verifyResp.ok) {
-                    try { showToast((verifyJson && verifyJson.error) || 'MFA verification failed', 'error'); } catch {}
-                    setIsLoading(false);
-                    return;
-                }
-                // On success, the server should return auth payload; fallback to original authJson
-                const authPayload = verifyJson?.auth || json.authJson || json;
-                if (authPayload && authPayload.access_token && authPayload.refresh_token) {
-                    const supabase = getSupabaseClient();
-                    if (typeof supabase.auth.setSession === 'function') {
-                        await supabase.auth.setSession({ access_token: authPayload.access_token, refresh_token: authPayload.refresh_token });
-                    }
-                }
-                onLogin();
-                try { showToast('Berhasil login', 'success'); } catch {}
-                setIsLoading(false);
-                return;
-            }
-
             // Successful sign-in: call onLogin and let App sync session
             onLogin();
             try { showToast('Berhasil login', 'success'); } catch {}
